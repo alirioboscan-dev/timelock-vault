@@ -1,0 +1,13 @@
+# Secretos: nunca se versionan
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+.next/
+.vercel/
+
+# Foundry
+contracts/out/
+contracts/cache/
