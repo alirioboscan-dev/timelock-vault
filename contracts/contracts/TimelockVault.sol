@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.34;
 
 /// @title Timelock Vault
 /// @notice Bóvedas de ahorro programado en ETH, sin rendimiento (1:1) y sin operador privilegiado.
 ///         - Individual: un titular deposita y retira todo cuando llega la fecha de desbloqueo.
-///         - Compartida (2/2): dos titulares aportan por separado; al vencer, con las dos
-///           aprobaciones, cada uno retira exactamente lo que aportó.
+///         - Compartida (2/2): quien la crea invita a otra persona, que debe aceptarla; recién
+///           entonces los dos aportan por separado y, al vencer, con las dos aprobaciones, cada
+///           uno retira exactamente lo que aportó. La fecha queda fija desde la creación.
 /// @dev Los retiros siguen Checks-Effects-Interactions: el saldo se pone en cero antes de transferir
 ///      con `call`, y si la transferencia falla se revierte todo.
 ///      Riesgo asumido (whitepaper, sección 5): en una bóveda compartida, si un titular pierde su clave
@@ -29,6 +30,7 @@ contract TimelockVault {
     struct SharedVault {
         address[2] participants;
         uint64 unlockTime;
+        bool accepted;
         string name;
         uint256[2] contributions;
         bool[2] approved;
@@ -61,8 +63,8 @@ contract TimelockVault {
         string name,
         uint64 unlockTime
     );
+    event SharedVaultAccepted(uint256 indexed sharedVaultId, address indexed partner);
     event SharedDeposited(uint256 indexed sharedVaultId, address indexed from, uint256 amount, uint256 newContribution);
-    event SharedUnlockTimeExtended(uint256 indexed sharedVaultId, uint64 previousUnlockTime, uint64 newUnlockTime);
     event WithdrawalApproved(uint256 indexed sharedVaultId, address indexed participant);
     event SharedWithdrawn(uint256 indexed sharedVaultId, address indexed to, uint256 amount);
 
@@ -77,6 +79,9 @@ contract TimelockVault {
     error VaultNotFound(uint256 vaultId);
     error NotOwner(uint256 vaultId, address caller);
     error NotParticipant(uint256 sharedVaultId, address caller);
+    error NotInvited(uint256 sharedVaultId, address caller);
+    error AlreadyAccepted();
+    error NotAccepted();
     error InvalidPartner(address partner);
     error StillLocked(uint64 unlockTime);
     error AlreadyWithdrawn();
@@ -154,16 +159,18 @@ contract TimelockVault {
     // Bóveda compartida (2/2)
     // ---------------------------------------------------------------------
 
-    /// @notice Crea una bóveda compartida con otra persona. Quien la crea puede hacer su primer
-    ///         aporte en la misma transacción (o enviar 0 y aportar después).
-    /// @param partner Dirección del segundo titular.
+    /// @notice Crea una bóveda compartida pendiente e invita a otra persona. No admite ETH: los
+    ///         aportes empiezan cuando el invitado la acepta. Solo se agrega a la lista de quien la crea.
+    /// @param partner Dirección del segundo titular (el invitado).
+    /// @param unlockTime Fecha de desbloqueo, en el futuro. No se puede cambiar después.
     /// @return sharedVaultId Identificador de la bóveda compartida.
     function createSharedVault(string calldata name, address partner, uint64 unlockTime)
         external
-        payable
         returns (uint256 sharedVaultId)
     {
-        if (partner == address(0) || partner == msg.sender) revert InvalidPartner(partner);
+        if (partner == address(0) || partner == msg.sender || partner == address(this)) {
+            revert InvalidPartner(partner);
+        }
         _checkName(name);
         _checkFuture(unlockTime);
 
@@ -173,42 +180,38 @@ contract TimelockVault {
         s.unlockTime = unlockTime;
         s.name = name;
         _sharedVaultsOf[msg.sender].push(sharedVaultId);
-        _sharedVaultsOf[partner].push(sharedVaultId);
 
         emit SharedVaultCreated(sharedVaultId, msg.sender, partner, name, unlockTime);
+    }
 
-        if (msg.value > 0) {
-            s.contributions[0] = msg.value;
-            emit SharedDeposited(sharedVaultId, msg.sender, msg.value, msg.value);
-        }
+    /// @notice El invitado acepta la bóveda compartida. Recién entonces aparece en su lista y
+    ///         los dos pueden aportar y aprobar. Se acepta una sola vez.
+    function acceptSharedVault(uint256 sharedVaultId) external {
+        SharedVault storage s = _existingSharedVault(sharedVaultId);
+        if (msg.sender != s.participants[1]) revert NotInvited(sharedVaultId, msg.sender);
+        if (s.accepted) revert AlreadyAccepted();
+
+        s.accepted = true;
+        _sharedVaultsOf[msg.sender].push(sharedVaultId);
+        emit SharedVaultAccepted(sharedVaultId, msg.sender);
     }
 
     /// @notice Un titular suma su aporte. Cada aporte se registra por separado.
     function depositShared(uint256 sharedVaultId) external payable {
         if (msg.value == 0) revert ZeroDeposit();
         (SharedVault storage s, uint256 i) = _participantVault(sharedVaultId);
+        if (!s.accepted) revert NotAccepted();
         if (s.withdrawn[i]) revert AlreadyWithdrawn();
 
         s.contributions[i] += msg.value;
         emit SharedDeposited(sharedVaultId, msg.sender, msg.value, s.contributions[i]);
     }
 
-    /// @notice Posterga la fecha de desbloqueo. Requiere que ninguno haya aprobado todavía,
-    ///         para que nadie apruebe un retiro y después se encuentre con otra fecha.
-    function extendSharedUnlockTime(uint256 sharedVaultId, uint64 newUnlockTime) external {
-        (SharedVault storage s,) = _participantVault(sharedVaultId);
-        if (s.approved[0] || s.approved[1]) revert AlreadyApproved();
-        if (newUnlockTime <= s.unlockTime) revert UnlockTimeNotLater(s.unlockTime, newUnlockTime);
-
-        uint64 previous = s.unlockTime;
-        s.unlockTime = newUnlockTime;
-        emit SharedUnlockTimeExtended(sharedVaultId, previous, newUnlockTime);
-    }
-
     /// @notice Un titular aprueba el retiro. Se puede aprobar antes o después de la fecha;
     ///         el retiro igual exige que la fecha haya llegado. La aprobación no se revoca.
     function approveWithdrawal(uint256 sharedVaultId) external {
         (SharedVault storage s, uint256 i) = _participantVault(sharedVaultId);
+        if (!s.accepted) revert NotAccepted();
         if (s.approved[i]) revert AlreadyApproved();
 
         s.approved[i] = true;

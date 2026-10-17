@@ -23,8 +23,12 @@ contract ReentrancyAttacker {
         vault.withdraw(vaultId);
     }
 
-    function createSharedVault(address partner, uint64 unlockTime) external payable {
-        sharedVaultId = vault.createSharedVault{value: msg.value}("ataque", partner, unlockTime);
+    function createSharedVault(address partner, uint64 unlockTime) external {
+        sharedVaultId = vault.createSharedVault("ataque", partner, unlockTime);
+    }
+
+    function depositShared() external payable {
+        vault.depositShared{value: msg.value}(sharedVaultId);
     }
 
     function approveShared() external {

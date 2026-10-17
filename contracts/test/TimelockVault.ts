@@ -5,6 +5,7 @@ const { ethers, networkHelpers } = await network.create();
 const { time, loadFixture } = networkHelpers;
 
 const DIA = 24 * 60 * 60;
+const MAX_UINT64 = 2n ** 64n - 1n;
 
 async function desplegar() {
   const [alicia, bruno, carla] = await ethers.getSigners();
@@ -24,9 +25,9 @@ async function conBovedaIndividual() {
 async function conBovedaCompartida() {
   const base = await desplegar();
   const { vault, alicia, bruno, desbloqueo } = base;
-  await vault
-    .connect(alicia)
-    .createSharedVault("Ahorro para la casa", bruno.address, desbloqueo, { value: ethers.parseEther("0.3") });
+  await vault.connect(alicia).createSharedVault("Ahorro para la casa", bruno.address, desbloqueo);
+  await vault.connect(bruno).acceptSharedVault(1n);
+  await vault.connect(alicia).depositShared(1n, { value: ethers.parseEther("0.3") });
   await vault.connect(bruno).depositShared(1n, { value: ethers.parseEther("0.7") });
   return { ...base, id: 1n };
 }
@@ -182,33 +183,63 @@ describe("TimelockVault: bóveda individual", function () {
 });
 
 describe("TimelockVault: bóveda compartida (2/2)", function () {
-  it("crea la bóveda con los dos titulares y registra cada aporte por separado", async function () {
+  it("crea la bóveda pendiente, el invitado la acepta y cada aporte se registra por separado", async function () {
     const { vault, alicia, bruno, desbloqueo } = await loadFixture(desplegar);
-    await expect(
-      vault
-        .connect(alicia)
-        .createSharedVault("Ahorro para la casa", bruno.address, desbloqueo, { value: ethers.parseEther("0.3") }),
-    )
+    await expect(vault.connect(alicia).createSharedVault("Ahorro para la casa", bruno.address, desbloqueo))
       .to.emit(vault, "SharedVaultCreated")
-      .withArgs(1n, alicia.address, bruno.address, "Ahorro para la casa", desbloqueo)
-      .and.to.emit(vault, "SharedDeposited")
+      .withArgs(1n, alicia.address, bruno.address, "Ahorro para la casa", desbloqueo);
+
+    let s = await vault.getSharedVaultDetails(1n);
+    expect(s.accepted).to.equal(false);
+    expect(await vault.getSharedVaultsOf(alicia.address)).to.deep.equal([1n]);
+    expect(await vault.getSharedVaultsOf(bruno.address)).to.deep.equal([]);
+
+    await expect(vault.connect(bruno).acceptSharedVault(1n))
+      .to.emit(vault, "SharedVaultAccepted")
+      .withArgs(1n, bruno.address);
+    expect(await vault.getSharedVaultsOf(bruno.address)).to.deep.equal([1n]);
+
+    await expect(vault.connect(alicia).depositShared(1n, { value: ethers.parseEther("0.3") }))
+      .to.emit(vault, "SharedDeposited")
       .withArgs(1n, alicia.address, ethers.parseEther("0.3"), ethers.parseEther("0.3"));
     await vault.connect(bruno).depositShared(1n, { value: ethers.parseEther("0.7") });
 
-    const s = await vault.getSharedVaultDetails(1n);
+    s = await vault.getSharedVaultDetails(1n);
     expect(s.participants).to.deep.equal([alicia.address, bruno.address]);
+    expect(s.accepted).to.equal(true);
     expect(s.contributions).to.deep.equal([ethers.parseEther("0.3"), ethers.parseEther("0.7")]);
     expect(s.approved).to.deep.equal([false, false]);
-    expect(await vault.getSharedVaultsOf(alicia.address)).to.deep.equal([1n]);
-    expect(await vault.getSharedVaultsOf(bruno.address)).to.deep.equal([1n]);
   });
 
-  it("se puede crear sin aporte inicial", async function () {
+  it("crear no admite ETH, y antes de aceptar nadie puede aportar ni aprobar", async function () {
     const { vault, alicia, bruno, desbloqueo } = await loadFixture(desplegar);
-    await expect(vault.connect(alicia).createSharedVault("Sin aporte", bruno.address, desbloqueo)).not.to.emit(
-      vault,
-      "SharedDeposited",
-    );
+    // createSharedVault no es payable: se arma la transacción a mano para mandarle valor.
+    const data = vault.interface.encodeFunctionData("createSharedVault", ["x", bruno.address, desbloqueo]);
+    await expect(alicia.sendTransaction({ to: await vault.getAddress(), data, value: 1n })).to.revert(ethers);
+
+    await vault.connect(alicia).createSharedVault("x", bruno.address, desbloqueo);
+    for (const titular of [alicia, bruno]) {
+      await expect(vault.connect(titular).depositShared(1n, { value: 1n })).to.be.revertedWithCustomError(
+        vault,
+        "NotAccepted",
+      );
+      await expect(vault.connect(titular).approveWithdrawal(1n)).to.be.revertedWithCustomError(vault, "NotAccepted");
+    }
+  });
+
+  it("solo el invitado acepta, y una sola vez", async function () {
+    const { vault, alicia, bruno, carla, desbloqueo } = await loadFixture(desplegar);
+    await vault.connect(alicia).createSharedVault("x", bruno.address, desbloqueo);
+    await expect(vault.connect(carla).acceptSharedVault(1n))
+      .to.be.revertedWithCustomError(vault, "NotInvited")
+      .withArgs(1n, carla.address);
+    await expect(vault.connect(alicia).acceptSharedVault(1n))
+      .to.be.revertedWithCustomError(vault, "NotInvited")
+      .withArgs(1n, alicia.address);
+    await expect(vault.connect(bruno).acceptSharedVault(99n)).to.be.revertedWithCustomError(vault, "VaultNotFound");
+    await vault.connect(bruno).acceptSharedVault(1n);
+    await expect(vault.connect(bruno).acceptSharedVault(1n)).to.be.revertedWithCustomError(vault, "AlreadyAccepted");
+    expect(await vault.getSharedVaultsOf(bruno.address)).to.deep.equal([1n]);
   });
 
   it("rechaza un segundo titular inválido", async function () {
@@ -219,6 +250,10 @@ describe("TimelockVault: bóveda compartida (2/2)", function () {
     await expect(
       vault.connect(alicia).createSharedVault("x", alicia.address, desbloqueo),
     ).to.be.revertedWithCustomError(vault, "InvalidPartner");
+    const contrato = await vault.getAddress();
+    await expect(vault.connect(alicia).createSharedVault("x", contrato, desbloqueo))
+      .to.be.revertedWithCustomError(vault, "InvalidPartner")
+      .withArgs(contrato);
   });
 
   it("solo los titulares aportan, aprueban o retiran", async function () {
@@ -292,26 +327,39 @@ describe("TimelockVault: bóveda compartida (2/2)", function () {
 
   it("un titular que no aportó no tiene nada para retirar", async function () {
     const { vault, alicia, bruno, desbloqueo } = await loadFixture(desplegar);
-    await vault.connect(alicia).createSharedVault("x", bruno.address, desbloqueo, { value: 1n });
+    await vault.connect(alicia).createSharedVault("x", bruno.address, desbloqueo);
+    await vault.connect(bruno).acceptSharedVault(1n);
+    await vault.connect(alicia).depositShared(1n, { value: 1n });
     await vault.connect(alicia).approveWithdrawal(1n);
     await vault.connect(bruno).approveWithdrawal(1n);
     await time.increaseTo(desbloqueo);
     await expect(vault.connect(bruno).withdrawShared(1n)).to.be.revertedWithCustomError(vault, "NothingToWithdraw");
   });
 
-  it("la fecha se posterga solo mientras nadie aprobó", async function () {
+  it("la fecha compartida queda fija desde la creación (R-03)", async function () {
     const { vault, alicia, bruno, id, desbloqueo } = await loadFixture(conBovedaCompartida);
-    await expect(vault.connect(bruno).extendSharedUnlockTime(id, desbloqueo + 1n))
-      .to.emit(vault, "SharedUnlockTimeExtended")
-      .withArgs(id, desbloqueo, desbloqueo + 1n);
-    await expect(vault.connect(bruno).extendSharedUnlockTime(id, desbloqueo)).to.be.revertedWithCustomError(
-      vault,
-      "UnlockTimeNotLater",
-    );
+    // Ya no existe ninguna función para cambiarla.
+    expect(vault.interface.hasFunction("extendSharedUnlockTime")).to.equal(false);
+    expect(vault.interface.hasEvent("SharedUnlockTimeExtended")).to.equal(false);
+
+    // El ataque de R-03: Bruno, ya vencida la fecha, intenta re-bloquearla hasta 2^64-1
+    // llamando a la función eliminada por su selector. La llamada revierte.
+    await time.increaseTo(desbloqueo + 1n);
+    const viejo = new ethers.Interface(["function extendSharedUnlockTime(uint256,uint64)"]);
+    await expect(
+      bruno.sendTransaction({
+        to: await vault.getAddress(),
+        data: viejo.encodeFunctionData("extendSharedUnlockTime", [id, MAX_UINT64]),
+      }),
+    ).to.revert(ethers);
+
     await vault.connect(alicia).approveWithdrawal(id);
-    await expect(vault.connect(bruno).extendSharedUnlockTime(id, desbloqueo + 2n)).to.be.revertedWithCustomError(
-      vault,
-      "AlreadyApproved",
+    await vault.connect(bruno).approveWithdrawal(id);
+    expect((await vault.getSharedVaultDetails(id)).unlockTime).to.equal(desbloqueo);
+    await expect(vault.connect(alicia).withdrawShared(id)).to.changeEtherBalance(
+      ethers,
+      alicia,
+      ethers.parseEther("0.3"),
     );
   });
 
@@ -319,7 +367,9 @@ describe("TimelockVault: bóveda compartida (2/2)", function () {
     const { vault, bruno, desbloqueo } = await loadFixture(desplegar);
     const atacante = await ethers.deployContract("ReentrancyAttacker", [await vault.getAddress()]);
     const aporte = ethers.parseEther("1");
-    await atacante.createSharedVault(bruno.address, desbloqueo, { value: aporte });
+    await atacante.createSharedVault(bruno.address, desbloqueo);
+    await vault.connect(bruno).acceptSharedVault(1n);
+    await atacante.depositShared({ value: aporte });
     await vault.connect(bruno).depositShared(1n, { value: ethers.parseEther("2") });
     await atacante.approveShared();
     await vault.connect(bruno).approveWithdrawal(1n);
