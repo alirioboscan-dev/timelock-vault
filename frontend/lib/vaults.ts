@@ -1,20 +1,29 @@
 export type VaultKind = 'individual' | 'shared'
-export type VaultStatus = 'locked' | 'available' | 'released'
+export type VaultStatus = 'pending' | 'locked' | 'available' | 'released'
 
 export type Contribution = {
   address: string
   amount: number
+  /** Monto exacto en wei, solo en bóvedas leídas del contrato. */
+  amountWei?: bigint
   withdrawn: boolean
 }
 
 export type Vault = {
   id: string
+  /** Identificador numérico en el contrato (los de individuales y compartidas se numeran por separado). */
+  onchainId?: bigint
   kind: VaultKind
   name: string
-  createdAt: string
+  /** Solo en modo demo: el contrato no guarda la fecha de creación. */
+  createdAt?: string
   unlockAt: string
   contributions: Contribution[]
   approvals: string[]
+  /** Compartida: si el invitado ya aceptó. En modo demo no se usa. */
+  accepted?: boolean
+  /** Compartida: invitación recibida que todavía no se aceptó. */
+  invitation?: boolean
 }
 
 export const DEMO_WALLET = '0x7A42...91cE'
@@ -57,7 +66,9 @@ export function createInitialVaults(): Vault[] {
 }
 
 export function getVaultStatus(vault: Vault): VaultStatus {
-  if (vault.contributions.every((entry) => entry.withdrawn)) return 'released'
+  if (vault.kind === 'shared' && vault.accepted === false) return 'pending'
+  // Retirada: alguien retiró y no queda nada por retirar (quien no aportó no tiene nada que retirar).
+  if (vault.contributions.some((entry) => entry.withdrawn) && vault.contributions.every((entry) => entry.withdrawn || entry.amount === 0)) return 'released'
   if (new Date(vault.unlockAt).getTime() <= Date.now() && (vault.kind === 'individual' || vault.approvals.length === 2)) return 'available'
   return 'locked'
 }
@@ -71,5 +82,5 @@ export function shortAddress(address: string) {
 }
 
 export function totalVaultAmount(vaults: Vault[]) {
-  return vaults.reduce((sum, vault) => sum + vault.contributions.reduce((vaultSum, contribution) => vaultSum + (contribution.withdrawn ? 0 : contribution.amount), 0), 0)
+  return vaults.filter((vault) => !vault.invitation).reduce((sum, vault) => sum + vault.contributions.reduce((vaultSum, contribution) => vaultSum + (contribution.withdrawn ? 0 : contribution.amount), 0), 0)
 }
