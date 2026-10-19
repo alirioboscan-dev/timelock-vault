@@ -114,7 +114,7 @@ export default function TimelockVault() {
     if (stored) setDemoVaults(JSON.parse(stored))
   }, [])
   useEffect(() => { window.localStorage.setItem('timelock-vault-demo', JSON.stringify(demoVaults)) }, [demoVaults])
-  useEffect(() => { if (toast) { const timer = window.setTimeout(() => setToast(null), toast.href ? 7000 : 3200); return () => window.clearTimeout(timer) } }, [toast])
+  useEffect(() => { if (toast) { const timer = window.setTimeout(() => setToast(null), toast.href ? 9000 : 6000); return () => window.clearTimeout(timer) } }, [toast])
 
   /** Lee las bóvedas del contrato. En modo silencioso (actualización periódica) no muestra carga ni avisos. */
   const reload = useCallback(async (silent = false) => {
@@ -163,16 +163,24 @@ export default function TimelockVault() {
   async function runTx(label: string, send: (timelock: Timelock) => Promise<ContractTransactionResponse>) {
     if (!wallet.signer) return
     const timelock = getTimelock(wallet.signer)
-    setBusy(label)
+    setBusy('Confirmá la operación en MetaMask…')
+    let txUrl: string | undefined
     try {
       const tx = await send(timelock)
-      notify('Transacción enviada. Esperando confirmación en Sepolia…', `${ETHERSCAN_URL}/tx/${tx.hash}`)
+      txUrl = `${ETHERSCAN_URL}/tx/${tx.hash}`
+      setBusy('Transacción enviada. Esperando confirmación en Sepolia (suele tardar unos 15 segundos)…')
+      notify('Transacción enviada. Esperando confirmación en Sepolia…', txUrl)
       await tx.wait()
-      notify(`${label}. Transacción confirmada.`, `${ETHERSCAN_URL}/tx/${tx.hash}`)
+      notify(`${label}. Transacción confirmada.`, txUrl)
       await reload()
       return true
     } catch (error) {
-      notify(friendlyError(error, timelock))
+      // Si la transacción llegó a enviarse y falló en la red, se muestra el link para revisarla.
+      // Un caso visto en las pruebas: la Cuenta inteligente de MetaMask (EIP-7702) hace pasar la operación por su propio contrato.
+      notify(txUrl
+        ? 'La transacción se envió pero falló en la red y no cambió nada. Si tenés activada la Cuenta inteligente de MetaMask, desactivala y probá de nuevo.'
+        : friendlyError(error, timelock), txUrl)
+      await reload(true)
       return false
     } finally {
       setBusy(null)
@@ -238,7 +246,11 @@ export default function TimelockVault() {
       if (!unlock || Number(unlock) * 1000 <= new Date(vault.unlockAt).getTime()) { notify('La nueva fecha tiene que ser posterior a la actual.'); return Promise.resolve(false) }
       return runTx('Fecha postergada', (c) => c.extendUnlockTime(vault.onchainId!, unlock))
     },
-    accept: (vault) => runTx('Invitación aceptada', (c) => c.acceptSharedVault(vault.onchainId!)),
+    accept: async (vault) => {
+      const ok = await runTx('Invitación aceptada', (c) => c.acceptSharedVault(vault.onchainId!))
+      if (ok) setDetailId(null) // Al aceptar se cierra el detalle; la bóveda ya aparece en Compartidas.
+      return ok
+    },
     approve: (vault) => runTx('Aprobación registrada', (c) => c.approveWithdrawal(vault.onchainId!)),
     withdraw: (vault) => runTx('Retiro realizado', (c) => vault.kind === 'shared' ? c.withdrawShared(vault.onchainId!) : c.withdraw(vault.onchainId!)),
   }
@@ -363,10 +375,11 @@ function ChainDetailModal({ vault, account, busy, actions, onClose }: { vault: V
       {vault.accepted && mine && !mine.withdrawn && <div className="action-panel compact"><span className="action-title">Sumar a tu aporte</span>{depositForm('Aportar')}</div>}
     </div>}
 
+    {busy && <p className="tx-status" role="status">{busy}</p>}
     <div className="detail-actions">
-      {vault.kind === 'shared' && !vault.accepted && myIndex === 1 && <button className="primary-button" onClick={() => actions.accept(vault)} disabled={disabled}>{busy ? 'Esperando confirmación…' : 'Aceptar invitación'} <Check /></button>}
+      {vault.kind === 'shared' && !vault.accepted && myIndex === 1 && <button className="primary-button" onClick={() => actions.accept(vault)} disabled={disabled}>Aceptar invitación <Check /></button>}
       {vault.kind === 'shared' && vault.accepted && <button className="outline-button" onClick={() => actions.approve(vault)} disabled={disabled || approvedByMe || !mine || mine.withdrawn}>{approvedByMe ? 'Ya aprobaste' : 'Aprobar retiro'}</button>}
-      {(vault.kind === 'individual' || vault.accepted) && <button className="primary-button" onClick={() => actions.withdraw(vault)} disabled={disabled || !unlocked || !mine || mine.withdrawn || mine.amount === 0 || (vault.kind === 'shared' && vault.approvals.length < 2)}>{busy ? 'Esperando confirmación…' : mine?.withdrawn ? 'Ya retiraste' : vault.kind === 'shared' ? 'Retirar mi aporte' : 'Retirar fondos'} <ArrowUpRight /></button>}
+      {(vault.kind === 'individual' || vault.accepted) && <button className="primary-button" onClick={() => actions.withdraw(vault)} disabled={disabled || !unlocked || !mine || mine.withdrawn || mine.amount === 0 || (vault.kind === 'shared' && vault.approvals.length < 2)}>{mine?.withdrawn ? 'Ya retiraste' : vault.kind === 'shared' ? 'Retirar mi aporte' : 'Retirar fondos'} <ArrowUpRight /></button>}
     </div>
     <p className="detail-footnote">Contrato verificado: <a href={explorer} target="_blank" rel="noopener noreferrer">{shortAddress(CONTRACT_ADDRESS)} en Etherscan</a></p>
   </div></div>

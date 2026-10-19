@@ -1,6 +1,6 @@
 // Capa de acceso al contrato TimelockVault: lecturas, transacciones y errores.
 // No depende de React ni del navegador, así se puede probar contra una red local.
-import { Contract, formatEther, getAddress, isAddress, type ContractRunner } from 'ethers'
+import { Contract, formatEther, getAddress, isAddress, type ContractRunner, type EventLog, type Log } from 'ethers'
 import { CONTRACT_ADDRESS, DEPLOY_BLOCK, ERROR_MESSAGES, MAX_NAME_BYTES, TIMELOCK_ABI } from './contract'
 import type { Vault } from './vaults'
 
@@ -93,7 +93,7 @@ export async function loadVaults(timelock: Contract, user: string) {
   let invitations: Vault[] = []
   let invitationsError = false
   try {
-    const events = await timelock.queryFilter(timelock.filters.SharedVaultCreated(null, null, user), DEPLOY_BLOCK)
+    const events = await queryInvitationEvents(timelock, user)
     const known = new Set(sharedIds.map(String))
     const pendingIds = [...new Set(events.map((e) => ('args' in e ? (e.args[0] as bigint) : null)).filter((id): id is bigint => id !== null))]
       .filter((id) => !known.has(String(id)))
@@ -103,11 +103,29 @@ export async function loadVaults(timelock: Contract, user: string) {
       .filter((r): r is PromiseFulfilledResult<Vault> => r.status === 'fulfilled')
       .map((r) => ({ ...r.value, invitation: true }))
       .filter((v) => !v.accepted)
-  } catch {
+  } catch (error) {
+    console.warn('No se pudieron leer las invitaciones:', error)
     invitationsError = true
   }
 
   return { vaults: [...vaults, ...invitations], invitationsError }
+}
+
+// Los nodos RPC (el de MetaMask incluido) limitan cuántos bloques abarca una consulta de eventos,
+// así que las invitaciones se buscan en tramos desde el bloque de despliegue.
+const LOG_CHUNK = 5_000
+
+async function queryInvitationEvents(timelock: Contract, user: string) {
+  const provider = timelock.runner?.provider
+  if (!provider) throw new Error('Sin proveedor para leer eventos')
+  const latest = await provider.getBlockNumber()
+  const filter = timelock.filters.SharedVaultCreated(null, null, user)
+  const events: (EventLog | Log)[] = []
+  for (let from = DEPLOY_BLOCK; from <= latest; from += LOG_CHUNK) {
+    const to = Math.min(from + LOG_CHUNK - 1, latest)
+    events.push(...(await timelock.queryFilter(filter, from, to)))
+  }
+  return events
 }
 
 /** Traduce cualquier error de ethers, MetaMask o el contrato a un mensaje para el usuario. */

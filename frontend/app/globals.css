@@ -40,3 +40,5 @@ button, input, select { font: inherit; } button { cursor: pointer; }
 .vault-form input[type="datetime-local"] { color-scheme: dark; }
 .toast { max-width: 440px; line-height: 1.45; }
 @media (max-width: 700px) { .inline-form { flex-direction: column; } }
+
+.tx-status { margin: 14px 0 0; padding: 10px 14px; border: 1px solid rgba(242, 184, 75, 0.35); border-radius: 10px; background: rgba(242, 184, 75, 0.08); color: #f2b84b; font-size: 12px; }
